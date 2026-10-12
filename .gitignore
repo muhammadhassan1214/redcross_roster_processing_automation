@@ -1,0 +1,9 @@
+venv
+.env
+__pycache__/
+downloads
+chrome-dir
+*.log
+class_state.json
+failed_classes.txt
+.idea
