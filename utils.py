@@ -20,8 +20,6 @@ from selenium.common.exceptions import (
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-download_dir = os.path.join(BASE_DIR, "downloads")
-os.makedirs(download_dir, exist_ok=True)
 
 STATE_FILE = os.path.join(BASE_DIR, "class_state.json")
 LOG_FILE = os.path.join(BASE_DIR, "automation.log")
@@ -259,13 +257,13 @@ def get_undetected_driver(headless: bool = False, max_retries: int = 3) -> Optio
             if path:
                 options.add_argument(f"--user-data-dir={path}")
 
-            prefs = {
-                "download.default_directory": download_dir,
-                "download.prompt_for_download": False,
-                "directory_upgrade": True,
-                "safebrowsing.enabled": True,
-            }
-            options.add_experimental_option("prefs", prefs)
+            # prefs = {
+            #     "download.default_directory": download_dir,
+            #     "download.prompt_for_download": False,
+            #     "directory_upgrade": True,
+            #     "safebrowsing.enabled": True,
+            # }
+            # options.add_experimental_option("prefs", prefs)
 
             options.add_argument("--log-level=3")
             options.add_argument("--no-sandbox")
@@ -726,6 +724,24 @@ def record_failed_class(url: str) -> None:
             f.write(url.strip() + "\n")
     except Exception as e:
         logger.error(f"Could not write to {FAILED_CLASSES_FILE}: {e}")
+
+
+def remove_failed_class(url: str) -> bool:
+    """Remove a class URL from failed_classes.txt (e.g. it failed earlier but has now succeeded).
+    Returns True if it was in the file."""
+    try:
+        failed = get_failed_classes()
+        target = url.strip().rstrip("/")
+        remaining = [u for u in failed if u.rstrip("/") != target]
+        if len(remaining) == len(failed):
+            return False
+        with open(FAILED_CLASSES_FILE, "w", encoding="utf-8") as f:
+            f.write("".join(u + "\n" for u in remaining))
+        logger.info(f"Removed {url} from {os.path.basename(FAILED_CLASSES_FILE)} (it succeeded this time)")
+        return True
+    except Exception as e:
+        logger.error(f"Could not update {FAILED_CLASSES_FILE}: {e}")
+        return False
 
 
 def get_failed_classes() -> list:

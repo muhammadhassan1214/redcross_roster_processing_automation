@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from utils import (
     logger, get_undetected_driver, is_driver_alive, close_extra_tabs,
     load_state, save_state, parse_class_date,
-    record_failed_class, get_failed_classes, send_discord_message,
+    record_failed_class, get_failed_classes, send_discord_message, remove_failed_class,
 )
 from enrollNationwideFunctions import (
     login_to_enrollNationwide, open_next_class, open_class_page, get_class_details,
@@ -281,6 +281,7 @@ def main():
 
             if result is True:
                 summary["finished"] += 1
+                remove_failed_class(link)   # it may have failed in an earlier run and been fixed since
             elif result is None:
                 summary["skipped"] += 1
             else:
