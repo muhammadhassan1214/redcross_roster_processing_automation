@@ -1,3 +1,4 @@
+import re
 import time
 from urllib.parse import urlparse
 from selenium.webdriver.common.by import By
@@ -87,23 +88,97 @@ def get_all_rosters_links(driver) -> list | None:
         return None
 
 
-def open_next_class(driver, skip: set) -> tuple:
-    """On the class list (RC Rosters), click the FIRST class that hasn't been tried yet in this run.
-    Only that one class is opened - nothing is read from the other classes.
+# Rosters finalized longer ago than this are skipped (Red Cross won't take a record after 48 hours)
+MAX_FINALIZED_DAYS = 1
+
+_AGE_UNITS_IN_DAYS = {"second": 1 / 86400, "minute": 1 / 1440, "hour": 1 / 24,
+                      "day": 1, "week": 7, "month": 30, "year": 365}
+
+
+def finalized_age_days(text: str):
+    """'finalized 56 minutes ago' -> 0.04, 'finalized 1 day ago' -> 1, 'finalized 1 week ago' -> 7.
+    Returns None if the text isn't in that format."""
+    t = " ".join((text or "").lower().split())
+    if "just now" in t or "moments ago" in t:
+        return 0.0
+    m = re.search(r"(\d+|an?|one)\s+(second|minute|hour|day|week|month|year)s?\s+ago", t)
+    if not m:
+        return None
+    amount = 1 if m.group(1) in ("a", "an", "one") else int(m.group(1))
+    return amount * _AGE_UNITS_IN_DAYS[m.group(2)]
+
+
+def check_roster_row(row) -> dict:
+    """Run the 3 checks on one row of the RC Rosters list.
+    Returns {"ok": bool, "reason": str, "missing": str}."""
+    P = EnrollNationwideRCRostersPage
+
+    # Check 1: missing data (e.g. SKU)
+    if row.find_elements(*P.row_missing):
+        missing = ", ".join(t for t in (" ".join((e.text or "").split()) for e in row.find_elements(*P.row_missing_text)) if t)
+        return {"ok": False, "reason": f"missing data: {missing or 'unknown'}", "missing": missing or "unknown"}
+
+    # Check 2: zero passed students
+    passed = row.find_elements(*P.row_passed)
+    passed_text = (passed[0].text or "").strip() if passed else ""
+    if passed_text.startswith("0"):
+        return {"ok": False, "reason": f"0 passed students ({passed_text})", "missing": ""}
+
+    # Check 3: finalization age (use the 2nd <small> when there are two)
+    smalls = row.find_elements(*P.row_finalized)
+    age_text = (smalls[1].text if len(smalls) >= 2 else smalls[0].text if smalls else "").strip()
+    days = finalized_age_days(age_text)
+    if days is None:
+        return {"ok": False, "reason": f"finalization time not readable ({age_text!r})", "missing": ""}
+    if days > MAX_FINALIZED_DAYS:
+        return {"ok": False, "reason": f"too old - {age_text} (can't record after 48 hours)", "missing": ""}
+
+    return {"ok": True, "reason": age_text, "missing": ""}
+
+
+def open_next_class(driver, skip: set, already_submitted: set = frozenset(), on_skip=None) -> tuple:
+    """On the class list (RC Rosters), open the FIRST valid roster that hasn't been tried yet in this run.
+
+    A roster is valid when it has no missing data, more than 0 passed students and was finalized
+    no more than 1 day ago. Invalid rosters are added to `skip` (so they're checked once per run)
+    and reported through on_skip(link, result). Rosters already submitted to Red Cross in an earlier
+    run (`already_submitted`) are always opened, so their certificates still get saved.
 
     Returns (status, link): ("opened", link) | ("empty", None) | ("none_left", None) | ("error", None)
     """
+    P = EnrollNationwideRCRostersPage
     try:
         if not safe_navigate_to_url(driver, QuickLinks.rc_rosters):
             return "error", None
-        if not check_element_exists(driver, EnrollNationwideRCRostersPage.all_classes, timeout=15):
+        if not check_element_exists(driver, P.roster_rows, timeout=15):
             return "empty", None
 
-        for element in driver.find_elements(*EnrollNationwideRCRostersPage.all_classes):
+        for row in driver.find_elements(*P.roster_rows):
+            links = row.find_elements(*P.row_link)
+            if not links:
+                continue
+            element = links[0]
             href = element.get_attribute("href")
             if not href or href.lower().startswith("javascript") or href in skip:
                 continue
-            logger.info(f"Opening class from the list: {element.text.strip() or href}")
+            title = (element.text or "").strip() or href
+
+            if href in already_submitted:
+                logger.info(f"Roster already submitted to Red Cross earlier - opening it to finish: {title}")
+            else:
+                result = check_roster_row(row)
+                if not result["ok"]:
+                    logger.info(f"Skipping roster '{title}': {result['reason']}")
+                    skip.add(href)
+                    if on_skip:
+                        try:
+                            on_skip(href, title, result)
+                        except Exception as e:
+                            logger.warning(f"Could not report skipped roster: {e}")
+                    continue
+                logger.info(f"Roster passed checks ({result['reason']}): {title}")
+
+            logger.info(f"Opening class from the list: {title}")
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", element)
             wait_for_page_load(driver)
             # if the click opened nothing (or a new tab), fall back to going to the link directly
@@ -135,6 +210,11 @@ def open_class_page(driver, class_link, username=None, password=None) -> bool:
     except Exception:
         logger.error(f"Class page did not load: {class_link}")
         return False
+
+
+def is_no_show(status: str) -> bool:
+    """True for 'No Show', 'No-Show', 'NoShow', 'no show' ... (any spacing/case/hyphen)."""
+    return re.sub(r"[^a-z]", "", (status or "").lower()) == "noshow"
 
 
 def get_class_details(driver, class_link, navigate: bool = False) -> dict | None:
@@ -178,8 +258,14 @@ def get_class_details(driver, class_link, navigate: bool = False) -> dict | None
             return None
 
         students_data = []
+        no_shows = []
         for name, email, result in zip(std_names, std_emails, std_results):
             full_name = name.text.strip()
+            status = result.text.strip()
+            # "No Show" students are left out completely: not entered on Red Cross, not counted
+            if is_no_show(status):
+                no_shows.append(full_name or email.text.strip() or "(no name)")
+                continue
             first_name, last_name = split_name(full_name)
             students_data.append({
                 "name": full_name,
@@ -187,8 +273,17 @@ def get_class_details(driver, class_link, navigate: bool = False) -> dict | None
                 "last_name": last_name,
                 "email": email.text.strip(),
                 "phone": "",
-                "result": "Successful" if result.text.strip() == "Complete" else "Not Evaluated",
+                "result": "Successful" if status == "Complete" else "Not Evaluated",
             })
+
+        roster_total = len(students_data) + len(no_shows)
+        if no_shows:
+            logger.info(f"Excluding {len(no_shows)} No Show student(s): {', '.join(no_shows)} - "
+                        f"processing {len(students_data)} of {roster_total}")
+        if roster_total and not students_data:
+            logger.error(f"Every student in this class is a No Show ({len(no_shows)}) - nothing to submit to Red Cross; "
+                         f"process this class manually")
+            return None
 
         class_details = {
             "sku": sku,
@@ -214,8 +309,9 @@ def get_class_details(driver, class_link, navigate: bool = False) -> dict | None
             logger.error(f"Class {class_link} is missing required data: {'; '.join(missing)}")
             return None
 
-        if enrolled_students and enrolled_students.isdigit() and int(enrolled_students) != len(students_data):
-            logger.warning(f"Header says {enrolled_students} enrolled but roster lists {len(students_data)} students; using roster count")
+        if enrolled_students and enrolled_students.isdigit() and int(enrolled_students) != roster_total:
+            logger.warning(f"Header says {enrolled_students} enrolled but roster lists {roster_total} students; using roster count")
+        # number of participants sent to Red Cross = roster minus No Shows (e.g. 6 enrolled, 1 No Show -> 5)
         class_details["enrolled_students"] = str(len(students_data))
 
         return class_details

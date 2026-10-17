@@ -1,5 +1,6 @@
 import re
 import time
+import requests
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import StaleElementReferenceException
@@ -533,6 +534,69 @@ def accept_agreement_and_finalize(driver, mark_stage=lambda stage: None) -> str:
         return UNCONFIRMED
 
 
+# ---------------------------------------------------------------------------
+# Certificate lookup: 1) Red Cross endpoint via requests (fast)  2) browser search (fallback)
+# ---------------------------------------------------------------------------
+CERT_SEARCH_ENDPOINT = ("https://www.redcross.org/on/demandware.store/Sites-RedCross-Site/default/"
+                        "Certificates-SearchCertificates")
+_CERT_HTTP = requests.Session()
+_CERT_HTTP.headers.update({
+    "accept": "text/html, */*; q=0.01",
+    "accept-language": "en-US,en;q=0.9",
+    "x-requested-with": "XMLHttpRequest",
+    "referer": QuickLinks.find_certificate,
+    "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"),
+})
+_CERT_ID_RE = re.compile(r"<input\b[^>]*\bid=[\"']certid[\"'][^>]*>", re.IGNORECASE)
+_VALUE_RE = re.compile(r"\bvalue=[\"']([^\"']*)[\"']", re.IGNORECASE)
+
+
+def _parse_cert_ids(html: str) -> list:
+    """Cert IDs from the endpoint's HTML - the same values the browser reads from input#certid."""
+    ids = []
+    for tag in _CERT_ID_RE.findall(html or ""):
+        m = _VALUE_RE.search(tag)
+        value = (m.group(1) if m else "").strip()
+        if value and value not in ids:
+            ids.append(value)
+    return ids
+
+
+def _copy_browser_cookies(driver) -> None:
+    """If the browser is on www.redcross.org, reuse its cookies (helps if the endpoint wants a session)."""
+    try:
+        if "www.redcross.org" in (driver.current_url or ""):
+            for c in driver.get_cookies():
+                _CERT_HTTP.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
+    except Exception:
+        pass
+
+
+def _lookup_certs_via_endpoint(driver, email: str) -> list:
+    """Ask the Red Cross certificate endpoint directly. Returns [] if it fails or finds nothing."""
+    try:
+        _copy_browser_cookies(driver)
+        r = _CERT_HTTP.get(CERT_SEARCH_ENDPOINT, params={"email": email, "format": "ajax"}, timeout=20)
+        if r.status_code != 200:
+            logger.info(f"Certificate endpoint returned HTTP {r.status_code} for {email} - using the browser instead")
+            return []
+        ids = _parse_cert_ids(r.text)
+        if ids:
+            logger.info(f"Certificate endpoint: {len(ids)} certificate(s) for {email}")
+        else:
+            logger.info(f"Certificate endpoint found no certificates for {email} - checking with the browser")
+        return ids
+    except Exception as e:
+        logger.info(f"Certificate endpoint failed for {email} ({e}) - using the browser instead")
+        return []
+
+
+def _lookup_certs(driver, email: str) -> list:
+    """Endpoint first; if it doesn't work (error, blocked, nothing found) fall back to the browser search."""
+    return _lookup_certs_via_endpoint(driver, email) or _lookup_certs_for_email(driver, email)
+
+
 def _lookup_certs_for_email(driver, email: str) -> list:
     """Search the public certificate page for one email and return cert IDs."""
     # FIX: reload the search page every time - after a search the input may no longer be on the page
@@ -573,7 +637,7 @@ def get_cert_links(driver, std_data: list, max_attempts: int = 4, wait_between: 
             if email in found:
                 continue
             try:
-                url = generate_redcross_url(email, _lookup_certs_for_email(driver, email))
+                url = generate_redcross_url(email, _lookup_certs(driver, email))
                 if url:
                     found[email] = url
             except Exception as e:

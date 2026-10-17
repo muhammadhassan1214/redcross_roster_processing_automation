@@ -163,6 +163,25 @@ def process_class(driver, link: str, state: dict) -> bool | None:
             close_extra_tabs(driver, main_handle)
 
 
+def handle_skipped_roster(state: dict, link: str, title: str, result: dict):
+    """A roster failed the list checks. Missing data -> Discord message, but only once per roster
+    (the list is checked every 30 minutes, so don't repeat the same alert)."""
+    missing = result.get("missing")
+    if not missing:
+        return   # 0 passed / too old: just skipped (already logged)
+    entry = state.setdefault(link, {})
+    if entry.get("missing_notified") == missing:
+        return
+    send_discord_message(
+        f"**Roster skipped - missing data**\n{title}\n{link}\n"
+        f"Missing: {missing}\n"
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    entry["missing_notified"] = missing
+    entry["updated"] = datetime.now().isoformat(timespec="seconds")
+    save_state(state)
+
+
 class ErrorCollector(logging.Handler):
     """Remembers the ERROR lines logged while one class is processed, for the Discord message."""
     def __init__(self):
@@ -253,7 +272,11 @@ def main():
                     break
 
             logger.info("Going to the class list to open the next class")
-            status, link = open_next_class(driver, attempted)
+            already_submitted = {l for l, e in state.items()
+                                 if e.get("stage") in (STAGE_SUBMITTING, "certs_saved", STAGE_FINISHED)}
+            status, link = open_next_class(
+                driver, attempted, already_submitted,
+                on_skip=lambda l, title, r: handle_skipped_roster(state, l, title, r))
             if status == "error":
                 logger.error("Could not load the class list (RC Rosters page); stopping")
                 break
@@ -261,7 +284,7 @@ def main():
                 logger.info("Class list is empty - all done")
                 break
             if status == "none_left":
-                logger.info("Only classes that failed earlier in this run are left on the list - stopping")
+                logger.info("No more rosters to process (the rest were skipped or failed earlier in this run) - stopping")
                 break
 
             attempted.add(link)

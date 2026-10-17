@@ -38,6 +38,13 @@ class EnrollNationwideLoginPage:
 class EnrollNationwideRCRostersPage:
     roster_table = lambda x: (By.XPATH, f"//form[@id= 'cbp-certs']/div[2]/div/span{x}")
     all_classes = (By.XPATH, "//tbody/tr/td/a[1]")
+    # one row per roster on the RC Rosters list; the parts below are looked up INSIDE a row
+    roster_rows = (By.XPATH, "//tbody/tr")
+    row_link = (By.XPATH, "./td/a[1]")
+    row_missing = (By.XPATH, "./td[2]/div/span[contains(@class, 'is-missing')]")
+    row_missing_text = (By.XPATH, "./td[2]/div/span[contains(@class, 'is-missing')]/small")
+    row_passed = (By.XPATH, "./td[4]")
+    row_finalized = (By.XPATH, "./td[3]/small")
     enrolled_std = (By.XPATH, "//li[text()= 'Enrolled']/strong")
     sku = (By.CSS_SELECTOR, ".cbp-sku-box > b")
     instructor_name = (By.XPATH, "//p[contains(text(), 'Instructor Name')]/child::strong")
